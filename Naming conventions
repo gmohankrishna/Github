@@ -1,0 +1,840 @@
+#!groovy
+def lib
+if ( !env.SHARED_LIBRARY_BRANCH ) {
+  lib = library("cb-devops")
+} else {
+  lib = library("cb-devops@${SHARED_LIBRARY_BRANCH}")
+}
+
+def defaultConfig
+def consumerGroups
+
+pipeline{
+  options { buildDiscarder(logRotator(daysToKeepStr: '7',numToKeepStr: '1')) }
+  agent {
+    node {
+      label "WINDOWS"
+    }
+  }
+  stages{
+    stage("scan-repos"){
+      steps{
+        script{
+          defaultConfig = lib.com.fitb.cb.Github.getGithubConfigYaml(this)
+          consumerGroups = lib.com.fitb.cb.Github.getGithubGroupsYaml(this)
+          //Delete all the previously generated files
+          if(isUnix()){
+            sh "rm *.json"
+            sh "rm *.html"
+            sh "rm *.zip"
+            sh "rm *.csv"
+          } else {
+            powershell("Remove-Item *.json")
+            powershell("Remove-Item *.html")
+            powershell("Remove-Item *.zip")
+            powershell("Remove-Item *.csv")
+          }
+        }
+        withCredentials([usernamePassword(credentialsId: "${defaultConfig.creds.release.id}", passwordVariable: 'password', usernameVariable: 'username')]) {
+          script{
+            def repositoryReports = []
+            def reportColumns = []
+            def addedReportColumns = [:]
+
+            def checkJenkinsFiles = defaultConfig.scan.checkJenkinsFiles
+            def repositories = getConsumerGithubRepositories(this, defaultConfig, password)
+            //Sort the repositories
+            // This is so that the final report is also sorted
+            // It has the side-effect of sorting the log messages
+            // so we 
+            repositories.sort{ a, b -> a.name.toLowerCase().compareTo(b.name.toLowerCase())}
+            for(def repo : repositories){
+              def repositoryReport = [:]
+              def repoName = repo.name
+              repositoryReport["REPOSITORY"] = "${repoName}"
+              if(!addedReportColumns["REPOSITORY"]){
+                def column = [key:"REPOSITORY",title:"Name"]
+                reportColumns.add(column)
+                addedReportColumns["REPOSITORY"] = column
+              }
+              repositoryReport["URL"] = "${repo.html_url}"
+              if(!addedReportColumns["URL"]){
+                def column = [key:"URL",title:"Repo Url"]
+                reportColumns.add(column)
+                addedReportColumns["URL"] = column
+              }
+              echo "Scanning Consumer Repository: ${repoName}"
+              def devOpsCodeOwnerSkipped = defaultConfig?.scan?.noDevOpsCodeOwnerChecks
+              def shouldSkipDevOpsCodeOwnerCheck = false
+              if(devOpsCodeOwnerSkipped) {
+                //using for loop so we can break out
+                for(def skippedName : devOpsCodeOwnerSkipped ) {
+                  if("${skippedName}" == "${repoName}"){
+                    shouldSkipDevOpsCodeOwnerCheck = true
+                    break
+                  }
+                }
+              }
+              def hasDevOpsGroupAccessIssue = false
+              if (!shouldSkipDevOpsCodeOwnerCheck && defaultConfig.scan.checkForDevOpsTeamInCodeowners){
+                def devOpsApproversGroupAccess = checkForDevOpsApproversGroup(this, defaultConfig, consumerGroups, password, repoName)
+                //If the above method returned anything (i.e. a non-null value or truthy),
+                // that means there was an access issue and
+                // what was returned is the access issue reason
+                if (devOpsApproversGroupAccess){
+                  hasDevOpsGroupAccessIssue = true
+                  repositoryReport["DEVOPS-TEAM-APPROVER-NO-WRITE-ACCESS"] = "${devOpsApproversGroupAccess}"
+                  if(!addedReportColumns["DEVOPS-TEAM-APPROVER-NO-WRITE-ACCESS"]){
+                    def column = [key:"DEVOPS-TEAM-APPROVER-NO-WRITE-ACCESS",title:"Jenkins File Approver Access Issue"]
+                    reportColumns.add(column)
+                    addedReportColumns["DEVOPS-TEAM-APPROVER-NO-WRITE-ACCESS"] = column
+                  }
+                }
+              }
+              def unprotected = []
+              def invalidProtection = []
+              def noCodeowners = []
+              def devOpsTeamNotJenkinsApprovers = []
+              def noJenkinsFiles = []
+              def branches = getBranchesToCheck(this, defaultConfig,password, repoName)
+              for(def branch : branches){
+                
+                def branchName = branch.name
+
+                /**
+                 * Get the protection details first so we know whether we can directly 
+                 * update the codeowners file.
+                 */
+                def protectionDetails = [:]
+                def isProtected = lib.com.fitb.cb.Github.isBranchProtected(this, defaultConfig, password,repoName,branchName, true, protectionDetails)
+
+                /*
+                 * Check for codeowners file
+                 */
+                def codeOwnersFileDetails = [:]
+                def shaRef = branch.commit["sha"]
+                echo "Scanning Branch ${branchName} for a CODEOWNERS file"
+                def codeOwnersFile = lib.com.fitb.cb.Github.getCodeownersFileFromRepo(this, defaultConfig, password, repoName, shaRef, codeOwnersFileDetails)
+                if(!codeOwnersFile){
+                  echo "Branch ${branchName} DOES NOT have a CODEOWNERS file"
+                  noCodeowners.add("${branchName}")
+                  if (!shouldSkipDevOpsCodeOwnerCheck) {
+                    //if there is no codeowners file,
+                    // then the devops team cannot be present
+                    devOpsTeamNotJenkinsApprovers.add("${branchName}")
+                  }
+                } else {
+                  echo "Branch ${branchName} has a CODEOWNERS file"
+                  if(!shouldSkipDevOpsCodeOwnerCheck && defaultConfig.scan.checkForDevOpsTeamInCodeowners){
+                    echo "Checking for .jenkins/* @Fifth-Third/consumer-devops-approvers line"
+
+                    def hasDevOpsAsOwners = (codeOwnersFile ==~ /(?s).*\.jenkins\/\*.*\@Fifth\-Third\/consumer\-devops\-approvers.*/)
+                    echo "hasDevOpsAsOwners=${hasDevOpsAsOwners}"
+                    if(!hasDevOpsAsOwners){
+                      echo "Branch ${branchName} has a CODEOWNERS file but the consumer-devops-approvers team isn't in the file"
+
+                      def autoAddDevOpsApproversSuccessful = false
+                      def autoAddDevOpsApprovers = defaultConfig.scan.autoAddDevOpsApproversToCodeowners
+                      if(autoAddDevOpsApprovers){
+                        codeOwnersFile = codeOwnersFile + "\n.jenkins/* @Fifth-Third/consumer-devops-approvers"
+                        echo "Updating CODEOWNERS file: ${codeOwnersFileDetails.path} to include .jenkins/* @Fifth-Third/consumer-devops-approvers"
+                        def encodedCodeOwnersFileContents = lib.com.fitb.cb.Github.encodeFileContents(codeOwnersFile)
+                        if(protectionDetails.protectionEnabled){
+                          echo "unprotecting ${branchName} branch in ${repoName} repo so we can update the CODEOWNERS file"
+                          unProtectBranch(this, defaultConfig, password, repoName, branchName)
+                        }
+
+                        /**
+                         * Update the CODEOWNERS file
+                         */
+                        def envMap = [
+                          "API_URL=${defaultConfig.api.url}/repos/Fifth-Third/${repoName}/contents/${codeOwnersFileDetails.path}",
+                          "TOKEN=${password}",
+                          "CONTENT=${encodedCodeOwnersFileContents}",
+                          "SHA=${codeOwnersFileDetails.sha}",
+                          "BRANCH=${branchName}"
+                        ]
+                        echo "codeOwnersFileDetails:\n${codeOwnersFileDetails}"
+                        echo "API_URL:\n${defaultConfig.api.url}/repos/Fifth-Third/${repoName}/contents/${codeOwnersFileDetails.path}"
+                        echo "CONTENT:\n${encodedCodeOwnersFileContents}"
+                        echo "SHA:\n${codeOwnersFileDetails.sha}"
+                        echo "BRANCH:\n${branchName}"
+                        def response
+                        withEnv(envMap){
+                          try{
+                            response = powershell(returnStdout: true, script:'''
+                              try{
+                                $Headers = @{ 
+                                  "Authorization"="token ${env:TOKEN}"; 
+                                  "Accept"="application/vnd.github.v3.repository+json"; 
+                                }
+                                $body = @{ 
+                                  "message"="adding consumer-devops-approvers group as approvers for .jenkins files";
+                                  "content"="${env:CONTENT}";
+                                  "sha"="${env:SHA}";
+                                  "branch"="${env:BRANCH}";
+                                }
+                                
+                                $Result = Invoke-WebRequest -Method 'PUT' -Uri ${env:API_URL} -Headers $Headers -ContentType "application/json" -Body ($body|ConvertTo-Json)
+                                Write-Output "$Result"
+                              } catch [System.Net.WebException] {
+                                  $e = $_.Exception
+                                  $response = $e.Response
+                                  $msg = $e.Message
+                                  $statusCode = [int]$response.StatusCode
+                                  write-host "Status Code: $statusCode"
+                                  write-host "An error occurred updating updating ${env:API_URL}: $msg"
+                                  $details = $_.ErrorDetails
+                                  Write-Output "$details.Message"
+                              } Catch {
+                                  $e = $_.Exception
+                                  $msg = $e.Message
+                                  write-host "An unexpected error occurred updating ${env:API_URL}: $msg"
+                                  write-host "$msg"
+                                  throw $e
+                              }
+                            ''')
+                            echo "CODEOWNER file update response: ${response}"
+                            autoAddDevOpsApproversSuccessful = true
+                          } catch (e) {
+                            echo "Unable to add .jenkins/* @Fifth-Third/consumer-devops-approvers to the end of the CODEOWNERS file: ${codeOwnersFileDetails.url}."
+                            ErrorUtils.printException(this, e)
+                          } finally{
+                            /*
+                             * We need to make sure that the branch get's protected if it was unprotected
+                             * regardless what happens with the codeowners update.
+                             */
+                            if(protectionDetails.protectionEnabled) {
+                              lib.com.fitb.cb.Github.protectBranch(this, defaultConfig, password, repoName, branchName)
+                              isProtected = true
+                            }
+                          }
+                        }
+                      }
+                      if (!autoAddDevOpsApproversSuccessful){
+                        devOpsTeamNotJenkinsApprovers.add("${branchName}")
+                      }
+                    }
+                  } else {
+                    echo "Skipping check for .jenkins/* @Fifth-Third/consumer-devops-approvers line in CODEOWNERS file"
+                  }
+                }
+
+                // This returns false for several reasons,
+                // need to check the protectionDetails for why
+                if(!isProtected){
+                  def isAutoProtected = false
+                  if(defaultConfig.scan.autoProtectBranches){
+                    try{
+                      /**
+                      * Current branch is protected but with invalid settings
+                      * We need to unprotect the branch first to guarantee that
+                      * the correct settings are applied.
+                      */
+                      if(protectionDetails.protectionEnabled){
+                        echo "unprotecting ${branchName} branch in ${repoName} repo as it has invalid protection settings"
+                        unProtectBranch(this, defaultConfig, password, repoName, branchName)
+                        echo "unprotected ${branchName} branch in ${repoName} repo"
+                      }
+                      echo "attempting to protect ${branchName} branch in ${repoName} repo"
+                      isAutoProtected = lib.com.fitb.cb.Github.protectBranch(this, defaultConfig, password, repoName, branchName)
+                      if(isAutoProtected){
+                        echo "protected ${branchName} branch in ${repoName} repo"
+                      }
+                    } catch (e){
+                      echo("Error protecting ${branchName} branch in ${repoName} repo: ${e.message}")
+                    }
+                  }
+                  /**
+                   * if autoprotection was performed and an error did no happen,
+                   * do not add the branch to the unprotected or invalidProtection lists.
+                   *
+                   */
+                  if (!isAutoProtected){
+                    if (!protectionDetails.protectionEnabled){
+                      unprotected.add("${branchName}")
+                    } else {
+                      invalidProtection.add("${branchName} (${protectionDetails.protectionStatus})")
+                    }
+                  } else {
+                    isProtected = true
+                  }
+                }
+                
+
+                def skipped = defaultConfig?.scan?.noJenkinsFiles
+                def shouldBeSkipped = false
+                if(skipped) {
+                  //using for loop so we can break out
+                  for(def skippedName : skipped ) {
+                    if("${skippedName}" == "${repoName}"){
+                      shouldBeSkipped = true
+                      break
+                    }
+                  }
+                }
+                if(checkJenkinsFiles && !shouldBeSkipped){
+                  def jenkinsBuildFile = lib.com.fitb.cb.Github.getFileFromGithubBranch(this, defaultConfig, password, repoName, shaRef, ".jenkins/release-build.yaml")
+                  if(!jenkinsBuildFile) {
+                    noJenkinsFiles.add("${branchName}")
+                  }
+                }
+              }
+
+              /*
+               * Checking for non-functional account collaborators with admin access.
+               * Individuals should not be granted access to a repo directly
+               * The most common situation this is checking for is when
+               * a developer has created a repo and github has granted that user
+               * access to the repo as an admin by default and added the user
+               * to the collaborators section. Developers should remove
+               * themselves but often they do not.
+               */
+              echo "Checking for directly added collaborators with admin access on the ${repoName} repo"
+              def invalidContributors = getInvalidContributorsOnRepo(this, defaultConfig, password, repoName)
+              def removedInvalidContributors = false
+              if(invalidContributors){
+                /*
+                 * Automatically remove admin contributors if the config specifies to correct
+                 * this situation
+                 */
+                 def autoRemoveInvalidContributors = defaultConfig?.scan?.autoRemoveInvalidContributors
+                if(autoRemoveInvalidContributors){
+                  def newInvalidContributors = []
+                  /**
+                   * If we're going to auto-remove contributors
+                   * we need to know if any one of the removals failed
+                   * so we can report
+                   */
+                  removedInvalidContributors = true
+                  for (contributor in invalidContributors) {
+                    try{
+                      def removed = lib.com.fitb.cb.Github.removeCollaborator(this, defaultConfig, password, repoName, contributor)
+                      if(!removed){
+                        removedInvalidContributors = false
+                        newInvalidContributors.add(contributor)
+                      }
+                    } catch (e){
+                      echo("Error removing direct admin contributor(${contributor}) from ${branchName} branch in ${repoName} repo: ${e.message}")
+                      removedInvalidContributors = false
+                      newInvalidContributors.add(contributor)
+                    }
+                  }
+                  invalidContributors = newInvalidContributors
+                } 
+
+                //If the inv
+                if (!removedInvalidContributors){
+                  echo "found directly added collaborators with admin access on the ${repoName} repo"
+                  repositoryReport["INVALID_CONTRIBUTOR"] = invalidContributors
+                  if(!addedReportColumns["INVALID_CONTRIBUTOR"]){
+                    def column = [key:"INVALID_CONTRIBUTOR",title:"Users With Direct Admin Access"]
+                    reportColumns.add(column)
+                    addedReportColumns["INVALID_CONTRIBUTOR"] = column
+                  }
+
+                }
+              }
+
+
+
+              repositoryReport["UNPROTECTED-BRANCHES"] = unprotected
+              if(!addedReportColumns["UNPROTECTED-BRANCHES"]){
+                def column = [key:"UNPROTECTED-BRANCHES",title:"Unprotected Branches"]
+                reportColumns.add(column)
+                addedReportColumns["UNPROTECTED-BRANCHES"] = column
+              }
+              repositoryReport["INVALID-PROTECTION-BRANCHES"] = invalidProtection
+              if(!addedReportColumns["INVALID-PROTECTION-BRANCHES"]){
+                def column = [key:"INVALID-PROTECTION-BRANCHES",title:"Branches with Invalid Protection"]
+                reportColumns.add(column)
+                addedReportColumns["INVALID-PROTECTION-BRANCHES"] = column
+              }
+              repositoryReport["NO-CODEOWNERS-FILE"] = noCodeowners
+              if(!addedReportColumns["NO-CODEOWNERS-FILE"]){
+                def column = [key:"NO-CODEOWNERS-FILE",title:"Missing CODEOWNERS File"]
+                reportColumns.add(column)
+                addedReportColumns["NO-CODEOWNERS-FILE"] = column
+              }
+              if(checkJenkinsFiles) {
+                repositoryReport["NO-JENKINS-FILES"] = noJenkinsFiles
+                if(!addedReportColumns["NO-JENKINS-FILES"]){
+                  def column = [key:"NO-JENKINS-FILES",title:"Missing .jenkins/* Files"]
+                  reportColumns.add(column)
+                  addedReportColumns["NO-JENKINS-FILES"] = column
+                }
+              }
+              //Only need to include this if we're checking for it
+              if(defaultConfig.scan.checkForDevOpsTeamInCodeowners){
+                repositoryReport["DEVOPS-TEAM-NOT-JENKINS-APPROVERS"] = devOpsTeamNotJenkinsApprovers
+                if(!addedReportColumns["DEVOPS-TEAM-NOT-JENKINS-APPROVERS"]){
+                  def column = [key:"DEVOPS-TEAM-NOT-JENKINS-APPROVERS",title:"CODEOWNERS File Issue: Missing DevOps Team"]
+                  reportColumns.add(column)
+                  addedReportColumns["DEVOPS-TEAM-NOT-JENKINS-APPROVERS"] = column
+                }
+              }
+              if(hasDevOpsGroupAccessIssue || unprotected || noCodeowners || devOpsTeamNotJenkinsApprovers || noJenkinsFiles) {
+                repositoryReports.add(repositoryReport)
+              }
+            }
+            /**
+             * If there were no repository failures, just add a single column
+             * indicating no issues so the previous report gets overwritten
+             */
+            if(!repositoryReports){
+              def repositoryReport = [:]
+              reportColumns = []
+              def column = [key:"STATUS",title:"Status"]
+              reportColumns.add(column)
+              repositoryReport["STATUS"] = "No Repository Issues"
+              repositoryReports.add(repositoryReport)
+            }
+            if("${defaultConfig.scan.output.type}" == "json") {
+              writeDataAsJsonFile([buildScript: this, file: "${defaultConfig.scan.output.reportFileName}-${BUILD_NUMBER}.json", prettyPrint: true, archive: true, logToConsole: false, data: repositoryReports])
+            } else if("${defaultConfig.scan.output.type}" == "csv"){
+              writeDataAsCsvFile([buildScript: this, file: "${defaultConfig.scan.output.reportFileName}-${BUILD_NUMBER}.csv", archive: true, logToConsole: false, data: repositoryReports, reportColumns: reportColumns])
+            }
+            echo "writing ${defaultConfig.scan.output.reportFileName}.html file"
+
+            writeDataAsHtmlFile([buildScript: this, file: "${defaultConfig.scan.output.reportFileName}.html", archive: false, publish:true, logToConsole: false, title: "Consumer Respository Scan", data: repositoryReports, reportColumns: reportColumns])
+
+          }//End script
+        }//end withCredentials
+      }//end steps
+      post{
+        success {
+          script{
+            def attachments
+            if("${defaultConfig.scan.output.type}" == "json") {
+              attachments = "${defaultConfig.scan.output.reportFileName}-${BUILD_NUMBER}.json"
+            } else if("${defaultConfig.scan.output.type}" == "csv"){
+              attachments = "${defaultConfig.scan.output.reportFileName}-${BUILD_NUMBER}.csv"
+            }
+            
+            def body = 'Please review the attached file for any repositories you have that need to be addressed. ${FILE,path="Consumer-Repository-Scan-Report.html"}'
+
+            if(attachments){
+              emailext body: body, mimeType: 'text/html', subject: "${defaultConfig.scan.notification.subject}", to: "${defaultConfig.scan.notification.recipients.join(',')}", attachmentsPattern: "${attachments}"
+            } else {
+              emailext body: body, mimeType: 'text/html', subject: "${defaultConfig.scan.notification.subject}", to: "${defaultConfig.scan.notification.recipients.join(',')}"
+            }
+          }
+        }
+      }
+    }//end stage
+  }//end stages
+}//end pipeline
+
+def getConsumerGithubRepositories(buildScript, defaultConfig, token){
+  def repositories = []
+  def currentPage = 1
+  def githubApiUrl = "${defaultConfig.api.url}"
+  
+  def moreRecords = true
+  while (moreRecords) {
+    try{
+      def response
+      buildScript.echo "retrieving repositories on page # ${currentPage}"
+      def fullApiUrl="${githubApiUrl}/orgs/Fifth-Third/repos?per_page=100&page=${currentPage}"
+      buildScript.echo "API URL=${fullApiUrl}"
+      def envMap = [
+        "API_URL=${fullApiUrl}",
+        "TOKEN=${token}"
+
+      ]
+      buildScript.withEnv(envMap){
+        response = buildScript.powershell(returnStdout: true, script:'''
+          try{
+            $Headers = @{ 
+              "Authorization"="token ${env:TOKEN}"; 
+              "Accept"="application/vnd.github.v3.repository+json"; 
+            }
+            $Result = Invoke-WebRequest -Method 'GET' -Uri ${env:API_URL} -Headers $Headers -ContentType "application/json"
+            Write-Output "$Result"
+          } catch [System.Net.WebException] {
+              $e = $_.Exception
+              $response = $e.Response
+              $msg = $e.Message
+              $statusCode = [int]$response.StatusCode
+              write-host "Status Code: $statusCode"
+              if ($statusCode -ne 404) {
+                  write-host "An access error occurred getting ${env:API_URL}: $msg"
+                  throw $e
+              }
+          } Catch {
+              $e = $_.Exception
+              $msg = $e.Message
+              write-host "An unexpected error occurred getting ${env:API_URL}: $msg"
+              write-host "$msg"
+              throw $e
+          }
+        ''')
+      }
+
+      if(response == null){
+        error("No respositories could be found")
+        moreRecords = false
+        continue
+      }
+      
+      def pageRepos = buildScript.readJSON text: response
+      def responseHadRepos = false
+      for (repo in pageRepos) {
+        responseHadRepos = true
+        def repoName = "${repo.name}"?.toLowerCase()
+        def prefixes = defaultConfig.scan.prefixes
+        if(!prefixes){
+          prefixes = ["consumer-"]
+        }
+        def repoNameMatches = false
+        for (prefix in prefixes) {
+          if(repoName.startsWith("${prefix}")){
+            repoNameMatches = true
+            break
+          }
+        }
+        if(!repoNameMatches){
+          buildScript.echo "Skipping non-consumer repo ${repoName}"
+          continue
+        }
+
+        if(repo.archived){
+          buildScript.echo "Skipping archived consumer repo ${repoName}"
+          continue
+        }
+
+        def skipped = defaultConfig?.scan?.skipped
+        def shouldBeSkipped = false
+        if(skipped) {
+          //using for loop so we can break out
+          for(def skippedName : skipped ) {
+            if("${skippedName}" == "${repoName}"){
+              shouldBeSkipped = true
+              break
+            }
+          }
+        }
+        if(!shouldBeSkipped){
+          buildScript.echo "Adding consumer repo ${repoName}"
+          repositories.add(repo)
+        }
+      }
+      currentPage = currentPage + 1
+      if(!responseHadRepos){
+        buildScript.echo "No more repos returned"
+        moreRecords = false
+      }
+    } catch (e){
+      buildScript.echo "No more pages of repos found"
+      buildScript.ErrorUtils.printException(buildScript,e)
+      moreRecords = false
+    }
+  }
+  return repositories
+}
+
+def getBranchesToCheck(buildScript, defaultConfig, token, repoName){
+  def branches = []
+  def currentPage = 1
+  def githubApiUrl = "${defaultConfig.api.url}"
+  
+  def moreRecords = true
+  while (moreRecords) {
+    try{
+      def response
+      buildScript.echo "retrieving branches on page # ${currentPage}"
+      def fullApiUrl="${githubApiUrl}/repos/Fifth-Third/${repoName}/branches?per_page=100&page=${currentPage}"
+      buildScript.echo "API URL=${fullApiUrl}"
+      def envMap = [
+        "API_URL=${fullApiUrl}",
+        "TOKEN=${token}"
+
+      ]
+      buildScript.withEnv(envMap){
+        response = buildScript.powershell(returnStdout: true, script:'''
+          try{
+            $Headers = @{ 
+              "Authorization"="token ${env:TOKEN}"; 
+              "Accept"="application/vnd.github.v3.repository+json"; 
+            }
+            $Result = Invoke-WebRequest -Method 'GET' -Uri ${env:API_URL} -Headers $Headers -ContentType "application/json"
+            Write-Output "$Result"
+          } catch [System.Net.WebException] {
+              $e = $_.Exception
+              $response = $e.Response
+              $msg = $e.Message
+              $statusCode = [int]$response.StatusCode
+              write-host "Status Code: $statusCode"
+              if ($statusCode -ne 404) {
+                  write-host "An access error occurred getting ${env:API_URL}: $msg"
+                  throw $e
+              }
+          } Catch {
+              $e = $_.Exception
+              $msg = $e.Message
+              write-host "An unexpected error occurred getting ${env:API_URL}: $msg"
+              write-host "$msg"
+              throw $e
+          }
+        ''')
+      }
+      if(response == null){
+        error("No branches could be found")
+        moreRecords = false
+        continue
+      }
+      
+      def pageData = buildScript.readJSON text: response
+      def responseHadBranches = false
+      for (branch in pageData) {
+        def branchName = "${branch.name}"?.toLowerCase()
+        def branchesToCheck = defaultConfig.scan.branchesToCheck
+        def includeBranch = false
+        for (branchToCheck in branchesToCheck) {
+          buildScript.echo "Checking branch ${branchName} of for ${repoName}"
+          def name = branchToCheck.name
+          def checkType = branchToCheck.checkType
+          if (!buildScript.MethodUtils.respondsTo(branchName, "${checkType}", String)) {
+            buildScript.echo "skipping ${checkType} method call for ${branchName}"
+            continue
+          }
+          includeBranch = branchName."${checkType}"(name)
+          buildScript.echo "Should include branch: ${includeBranch}"
+          if(includeBranch){
+            break
+          }
+        }
+        if(includeBranch){
+          buildScript.echo "Found branch to check: ${branchName}"
+          branches.add(branch)
+          if(!responseHadBranches){
+            responseHadBranches = true
+          }
+        }
+      }
+      currentPage = currentPage + 1
+      if(!responseHadBranches){
+        buildScript.echo "No more branches returned"
+        moreRecords = false
+      }
+    } catch (e){
+      buildScript.echo "error getting branches for ${repoName}"
+      buildScript.ErrorUtils.printException(buildScript,e)
+      moreRecords = false
+      break
+    }
+  }
+  
+
+  return branches
+}
+
+def checkForDevOpsApproversGroup(buildScript, defaultConfig, consumerGroups, token, repoName){
+  /**
+    * 
+    */
+  def devOpsApproversId = "${consumerGroups.devops.approvers.id}"
+  def envMap = [
+    "API_URL=${defaultConfig.api.url}",
+    "TEAM_ID=${devOpsApproversId}",
+    "REPO_NAME=${repoName}",
+    "TOKEN=${token}"
+
+  ]
+  def response
+  buildScript.withEnv(envMap){
+    response = buildScript.powershell(returnStdout: true, script:'''
+      try{
+        $Headers = @{ 
+          "Authorization"="token ${env:TOKEN}"; 
+          "Accept"="application/vnd.github.v3.repository+json"; 
+        }
+        $Result = (Invoke-WebRequest -Method 'GET' -Uri ${env:API_URL}/teams/${env:TEAM_ID}/repos/Fifth-Third/${env:REPO_NAME} -Headers $Headers -ContentType "application/json")
+        Write-Output "$Result"
+      } catch [System.Net.WebException] {
+        $e = $_.Exception
+        $msg = $e.Message
+        $details = $_.ErrorDetails
+        $errorMessage = $details.Message | ConvertFrom-Json | Select-Object -Expand message
+        if("$errorMessage" -ne "Not Found"){
+          Write-Output "ACCESS_UNKNOWN"
+        } else {
+          Write-Host "Team id ${env:TEAM_ID} does not have access to the repo ${env:REPO_NAME}"
+          Write-Output "NO_ACCESS"
+        }
+      } Catch {
+        write-host "An Unexpected Error Occurred"
+        Write-Output "ACCESS_UNKNOWN"
+      }
+    ''')
+  }
+  if(response == null || response.contains('ACCESS_UNKNOWN')){
+    buildScript.echo "An error occurred determining if DevOps Approver Team (id: ${devOpsApproversId}) has access to repo ${repoName}"
+    return "ACCESS_UNKNOWN"
+  }
+  def access
+  if (response.contains("NO_ACCESS")) {
+    buildScript.echo "DevOps Approver Team (id: ${devOpsApproversId}) has no access to repo ${repoName}"
+    access = "NO_ACCESS"
+  } else {
+    //DevOps Approver group has access, verifying it has write access
+    responseJson = buildScript.readJSON text:response
+    if (!responseJson?.permissions?.push){
+      buildScript.echo "DevOps Approver Team (id: ${devOpsApproversId}) has access to repo ${repoName} but it is not write access"
+      access = "NO_PUSH_ACCESS"
+    } else {
+      buildScript.echo "DevOps Approver Team (id: ${devOpsApproversId}) has write access to repo ${repoName}"
+    }
+  }
+  /**
+   * If the DevOps approvers group does not have write access
+   * and the config says to automatically fix it,
+   * fix it and update the access flag to null
+   */
+  if (access && defaultConfig.scan.autoAddDevOpsApprovers){
+    /**
+      * DevOps Approvers group must have write access
+      * in order to be able to own the files in the .jenkins/* folder
+      * this will automatically add the group to all consumer repos
+      */
+    try{
+      buildScript.echo("Attempting to automatically add DevOps Approver Team (id: ${devOpsApproversId}) with write access to repo ${repoName}")
+      buildScript.withEnv(envMap){
+        response = buildScript.powershell(returnStdout: true, script:'''
+          try{
+            $Headers = @{ 
+              "Authorization"="token ${env:TOKEN}"; 
+              "Accept"="application/vnd.github.v3.repository+json"; 
+            }
+            $Result = (Invoke-WebRequest -Method 'PUT' -Uri ${env:API_URL}/teams/${env:TEAM_ID}/repos/Fifth-Third/${env:REPO_NAME} -Headers $Headers -ContentType "application/json" -Body '{ "permission": "write" }')
+            Write-Output "SUCCESS"
+          } catch [System.Net.WebException] {
+            $e = $_.Exception
+            $msg = $e.Message
+            $details = $_.ErrorDetails
+            $errorMessage = $details.Message | ConvertFrom-Json | Select-Object -Expand message
+            if("$errorMessage" -ne "You must have administrative rights on this repository."){
+              Write-Host "An unexpected error occurred adding the DevOps approvers team: $msg"
+              Write-Output "UNEXPECTED_FAILURE"
+            } else {
+              Write-Host "Our Jenkins users do not have admin access to the repo ${env:REPO_NAME} to add the DevOps approvers team."
+              Write-Output "FAILURE"
+            }
+          } Catch {
+            $e = $_.Exception
+            $msg = $e.Message
+            write-host "An Unexpected Error Occurred: $msg"
+            Write-Output "UNEXPECTED_FAILURE"
+          }
+        ''')
+      }
+
+
+      if(response == null || response.contains('UNEXPECTED_FAILURE')){
+        buildScript.echo("An unexpected error occurred trying to automatically add DevOps Approver Team (id: ${devOpsApproversId}) with write access to the repo ${repoName}")
+      } else if(response.contains('FAILURE')) {
+        buildScript.echo("Our Jenkins IDs do not have access to add the DevOps Approver Team (id: ${devOpsApproversId}) with write access to the repo ${repoName}")
+      } else {
+        access = null
+      }
+    } catch (e){
+      buildScript.echo "Unable to automatically add DevOps Approver Team (id: ${devOpsApproversId}) with write access to the repo ${repoName}"
+      buildScript.ErrorUtils.printException(buildScript,e)
+    } 
+  }
+
+  return access
+}
+
+
+def getInvalidContributorsOnRepo(buildScript, defaultConfig, token, repoName){
+  def invalidContributors = []
+  def allowedCollaborators = defaultConfig.scan.collaborators.allowed
+  def envMap = [
+    "API_URL=${defaultConfig.api.url}/repos/Fifth-Third/${repoName}/collaborators?affiliation=direct",
+    "TOKEN=${token}"
+
+  ]
+  def response
+  buildScript.withEnv(envMap){
+    response = buildScript.powershell(returnStdout: true, script:'''
+      try{
+        $Headers = @{ 
+          "Authorization"="token ${env:TOKEN}"; 
+          "Accept"="application/vnd.github.v3.repository+json"; 
+        }
+        $Result = Invoke-WebRequest -Method 'GET' -Uri ${env:API_URL} -Headers $Headers -ContentType "application/json"
+        Write-Output $Result.Content
+      } catch [System.Net.WebException] {
+        $e = $_.Exception
+        $msg = $e.Message
+        $details = $_.ErrorDetails
+        $errorMessage = $details.Message | ConvertFrom-Json | Select-Object -Expand message
+        if("$errorMessage" -ne "Not Found"){
+          Write-Output $Result.Content
+        } else {
+          Write-Host "Unable to list collaborators for ${env:API_URL}"
+        }
+      } Catch {
+        write-host "An Unexpected Error Occurred listing collaborators for ${env:API_URL}"
+      }
+    ''')
+  }
+  if(response == null) {
+    return invalidContributors
+  }
+  try{
+    def collaborators = buildScript.readJSON text: response
+    for (collaborator in collaborators) {
+      def login = collaborator.login
+      def isAllowed = false
+      for (allowed in allowedCollaborators) {
+        if("${login}" == "${allowed}"){
+          isAllowed = true
+          break
+        }
+      }
+      if(isAllowed){
+        continue
+      }
+
+      def hasAdmin = collaborator.permissions?.admin
+      if(hasAdmin){
+        invalidContributors.add(login)
+      }
+    }
+
+  } catch (e){
+    buildScript.echo "Unable to check for invalid collaborators on the ${repoName} repo"
+    buildScript.ErrorUtils.printException(buildScript,e)
+  }
+  return invalidContributors
+
+}
+
+/*
+ * This isn't in the Github class so it's not available as a method for app jenkins files to call
+ */
+def unProtectBranch(buildScript, githubConfig, token, repoName, branchName){
+  try{
+    def githubUrl = "${githubConfig?.api?.url}/repos/Fifth-Third/${repoName}/branches/${branchName}/protection"
+    if(buildScript.isUnix()){
+      def curlCommand="curl -X DELETE ${githubUrl} -H \"Authorization: token ${token}\""
+      def response = buildScript.sh(returnStdout: true, script: "${curlCommand}")
+      //echo "Response: ${response}"
+      if(response == null || response.contains('"message":')){
+          buildScript.error("Error unprotecting ${branchName} branch in ${repoName} repo")   
+      }
+    } else {
+      def curlCommand="Invoke-WebRequest -Method 'DELETE' -Uri ${githubUrl} -Headers @{\"Authorization\"=\"token ${token}\"} "
+      def response = buildScript.powershell(returnStdout: true, script:"${curlCommand}")
+      //echo "Response: ${response}"
+      if(response == null || !(response.contains('Status: 200 OK') || response.contains('Status: 204 No Content') || response.contains('"message":"Branch not protected"'))){
+          buildScript.error("Error unprotecting ${branchName} branch in ${repoName} repo")   
+      }
+    }
+  } catch (e){
+    buildScript.echo("Error unprotecting ${branchName} branch in ${repoName} repo")
+    buildScript.ErrorUtils.printException(buildScript, e)
+  }
+}
