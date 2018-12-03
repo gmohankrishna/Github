@@ -1,0 +1,182 @@
+
+import groovy.json.JsonSlurper
+
+
+pipeline {
+
+agent {label "DevServer"}
+
+stages {
+
+
+    
+    stage('Display Info sent by Webhook') {
+        
+        steps{
+            
+            script{
+
+def jsonSlurper = new JsonSlurper()
+def inputText = params.payload
+def jsonRepoObject = jsonSlurper.parseText(inputText)
+
+if (jsonRepoObject.action == "created") {
+
+
+
+/* println "jsonRepoObject generated out of JsonSlurper : " + jsonRepoObject */
+
+println "EVENT NAME:         " + jsonRepoObject.action
+println "REPOSITORY NAME:    " + jsonRepoObject.repository.name
+println "REPOSITORY URL:     " + jsonRepoObject.repository.clone_url
+println "CREATOR'S LOGIN:    " + jsonRepoObject.sender.login
+println "CREATOR'S LDAP-ID:  " + jsonRepoObject.sender.ldap_dn
+
+} // end of if repo created block
+
+
+if (jsonRepoObject.action == "deleted") {
+
+println "Deleting Repository : " + jsonRepoObject.repository.name
+    
+} // end of if repo deleted block
+
+
+
+} // end of script
+
+} // end of steps
+
+} // end of "Display Info sent by Webhook" stage
+
+
+
+stage ('Applying master branch protections') {
+
+steps {
+
+script {
+
+// Applying protection to master branch when repo is created.
+
+def jsonSlurper = new JsonSlurper()
+def inputText = params.payload
+def jsonRepoObject = jsonSlurper.parseText(inputText)
+
+
+if (jsonRepoObject.action == "created") {
+
+try {
+println ("Failed after this line")
+build job: 'Apply_Master_Branch_Protection', parameters: [[$class: 'StringParameterValue', name: 'repo_name', value: jsonRepoObject.repository.name], [$class: 'StringParameterValue', name: 'repo_creator', value: jsonRepoObject.sender.login]]
+println ("Failed before this line")
+} catch(Exception e){
+    currentBuild.result = 'SUCCESS'
+} // end catch
+
+
+} // end of if repo created block
+
+
+} // end of script
+
+} // end of steps
+
+
+} // end of "Applying master branch protections" stage
+
+
+
+
+} // end of stages
+
+} // end of pipeline
+
+
+
+
+
+echo "Repo name forwarded by Test_AutoBranch_Protect job: " ${repo_name}
+echo "Repo creator forwarded by Test_AutoBranch_Protect job: " ${repo_creator}
+
+# Applying protections on the master branch
+curl -H "Content-Type: application/json" -k -X PUT https://sogramihqghub99.53.com/api/v3/repos/Fifth-Third/${repo_name}/branches/master/protection --data '{ "required_status_checks": { "strict": true, "contexts": []}, "enforce_admins": true, "required_pull_request_reviews": {"dismiss_stale_reviews": true, "require_code_owner_reviews": true }, "restrictions": null }' -u t27455a:42ef65d62ee8e735d6e108bcc9878e6e27a8c080
+
+
+# GitHub: Fifth-Third/infrastructure-arunabh_hooks_repo/notify_illegal_repo.sh
+# Notifies repo creator and DevOps team if repo name does not meet standards.
+
+
+
+echo "********************************************************"
+echo "********************************************************"
+
+
+
+# Sending notification job parameters as a single string
+notification_parms=$repo_name\:$repo_creator
+
+
+
+org_lob=`echo ${repo_name} | cut -f2 -d '/'`
+lob1=`echo $org_lob | cut -f1 -d '-'`
+lob2=`echo $org_lob | cut -f2 -d '-'`
+
+# If repo name is illegal, triggering reporting job in jenkins
+
+ if [ "$lob1" != "consumer" -a "$lob1" != "edo" -a "$lob1" != "payments" -a "$lob1" != "commercial" -a "$lob1" != "infrastructure" -a "$lob1" != "info" -a "$lob1" != "strategy" ] ;
+  then 
+        curl -X POST -u t24179a:097330abbb0183ef7c97e460eda80811 http://cje-stage.info53.com/master-2/job/Report_Illegal_Repositories/buildWithParameters?parm1=${notification_parms}
+        exit 0
+ fi 
+
+ if [ "$lob1" = "info" -a "$lob2" != "security" ] ;
+   then 
+        curl -X POST -u t24179a:097330abbb0183ef7c97e460eda80811 http://cje-stage.info53.com/master-2/job/Report_Illegal_Repositories/buildWithParameters?parm1=${notification_parms}
+        exit 0
+ fi
+
+
+ if [ "$lob1" = "strategy" -a "$lob2" != "architecture" ] ;
+   then 
+        curl -X POST -u t24179a:097330abbb0183ef7c97e460eda80811 http://cje-stage.info53.com/master-2/job/Report_Illegal_Repositories/buildWithParameters?parm1=${notification_parms}
+        exit 0
+ fi
+
+if [ "$lob1" != "CCAS" -a "$lob1" != "iris" -a "$lob1" != "hi" -a "$lob1" != "devops" -a "$lob1" != "Finance" ] ;
+   then 
+        curl -X POST -u t24179a:097330abbb0183ef7c97e460eda80811 http://cje-stage.info53.com/master-2/job/Report_Illegal_Repositories/buildWithParameters?parm1=${notification_parms}
+        exit 0
+ fi
+
+if [ "$lob1" = "capital" -a "$lob2" != "markets" ] ;
+   then 
+        curl -X POST -u t24179a:097330abbb0183ef7c97e460eda80811 http://cje-stage.info53.com/master-2/job/Report_Illegal_Repositories/buildWithParameters?parm1=${notification_parms}
+        exit 0
+ fi
+ 
+exit 0
+
+
+
+
+
+
+def var="${params.parm1}".split(":")
+def repo_name=var[0]
+def repo_creator=var[1]
+def repo_creator_email= "${repo_creator}".replace('-','.')
+
+echo "Repo name forwarded by Test_AutoBranch_Protect job:  ${repo_name}"
+echo "Repo creator email forwarded by Test_AutoBranch_Protect job: ${repo_creator_email}@53.com"
+
+
+echo "********************************************************"
+
+emailext(
+                mimeType: 'text/html', 
+                to:"kalyana.kakkera@53.com, ${repo_creator_email}@53.com", 
+                subject: "Github Stage Repository: ${repo_name} not meeting naming standards", 
+                body: "Hi $repo_creator, The GitHub repository: $repo_name that you just created in github stage does not appear to follow naming standards. The repository name must start with a 'valid line of business'. Valid lines of businesses are: consumer, edo, infrastructure, commercial, payments, info-security and strategy-architecture. Please rename your repo in Settings, Options or note the need for your naming exception in the readme.md file. For more on Github standards please read the documentation at https://thebank.info53.com/teams/ES/SharedApps/devops/Source%20Code%20Mgmt%20Linked%20Documents/5-3%20Github%20User%20Standards.pdf."            )
+                    
+                    
