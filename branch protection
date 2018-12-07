@@ -1,0 +1,51 @@
+#!groovy
+def lib
+if ( !env.SHARED_LIBRARY_BRANCH ) {
+  lib = library("cb-devops")
+} else {
+  lib = library("cb-devops@${SHARED_LIBRARY_BRANCH}")
+}
+
+def defaultConfig
+
+pipeline{
+  options { buildDiscarder(logRotator(daysToKeepStr: '7',numToKeepStr: '1')) }
+  agent {
+    node {
+      label "WINDOWS"
+    }
+  }
+  parameters {
+    string(name: 'Repository', description: 'Repository Name')
+    string(name: 'Branch', description: 'Branch Name')
+  }
+  stages{
+    stage("protect-branch"){
+      steps{
+        script{
+          defaultConfig = lib.com.fitb.cb.Github.getGithubConfigYaml(this)
+        }
+    
+        withCredentials([usernamePassword(credentialsId: "${defaultConfig.creds.release.id}", passwordVariable: 'password', usernameVariable: 'username')]) {
+          script{
+            if(isUnix()){
+              def curlCommand="curl -X PUT https://github.info53.com/api/v3/repos/Fifth-Third/${params['Repository']}/branches/${params['Branch']}/protection -H \"Authorization: token ${password}\" -d '{\"required_status_checks\": { \"strict\": true, \"contexts\": []},\"enforce_admins\": true,\"required_pull_request_reviews\": {\"dismiss_stale_reviews\": true,\"require_code_owner_reviews\": true},\"restrictions\": null}' "
+              def response = sh(returnStdout: true, script: "${curlCommand}")
+              //echo "Response: ${response}"
+              if(response == null || response.contains('"message":')){
+                  error("response indicated a failure happened")   
+              }
+            } else {
+              def curlCommand="curl -Method 'PUT' -Uri https://github.info53.com/api/v3/repos/Fifth-Third/${params['Repository']}/branches/${params['Branch']}/protection -Headers @{\"Authorization\"=\"token ${password}\"} -Body '{\"required_status_checks\": { \"strict\": true, \"contexts\": []},\"enforce_admins\": true,\"required_pull_request_reviews\": {\"dismiss_stale_reviews\": true,\"require_code_owner_reviews\": true},\"restrictions\": null}' "
+              def response = powershell(returnStdout: true, script:"${curlCommand}")
+              //echo "Response: ${response}"
+              if(response == null || !response.contains('Status: 200 OK')){
+                  error("response indicated a failure happened")   
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
